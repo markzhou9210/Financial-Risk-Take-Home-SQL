@@ -1,0 +1,265 @@
+--SQL Query : Retrieve total merchants and batches for context. 
+SELECT COUNT(*) AS total_merchants FROM Merchant_application_data;
+SELECT COUNT(*) AS total_batches FROM Merchant_batch_performance_data;
+
+
+--SQL Query (Key Indicators): We used SQL to quantify factors to find merchants with unusually high transactions and their chargeback rate:
+SELECT COUNT(DISTINCT SimuID) AS merchants_total,
+       COUNT(DISTINCT CASE WHEN ChargebackFinalAmt > 0 THEN SimuID END) AS merchants_cb
+FROM Merchant_batch_performance_data
+WHERE SaleCt > 20;
+SELECT a.MCCDescription,
+       COUNT(DISTINCT a.SimuID) AS total_merchants,
+       COUNT(DISTINCT CASE WHEN b.ChargebackFinalAmt > 0 THEN a.SimuID END) AS merchants_with_cb,
+       (COUNT(DISTINCT CASE WHEN b.ChargebackFinalAmt > 0 THEN a.SimuID END) * 1.0
+        / COUNT(DISTINCT a.SimuID)) AS cb_rate
+FROM Merchant_application_data a
+LEFT JOIN Merchant_batch_performance_data b ON a.SimuID = b.SimuID
+GROUP BY a.MCCDescription
+HAVING COUNT(DISTINCT a.SimuID) >= 50
+ORDER BY cb_rate DESC
+LIMIT 5;
+
+
+--SQL Query (Rule Logic Illustration): To apply Rule 1-3
+-- Count merchants flagged by Rule 1
+SELECT COUNT(*) FROM Merchant_application_data
+WHERE AppVantageScr < 700
+   OR AppPublicRecords > 0 OR AppCollections > 0 OR AppAmountPastDue > 0;
+-- Count chargeback merchants caught by Rule 1
+SELECT COUNT(DISTINCT a.SimuID) 
+FROM Merchant_application_data a
+JOIN Merchant_batch_performance_data b ON a.SimuID = b.SimuID
+WHERE (a.AppVantageScr < 700 OR a.AppPublicRecords > 0 
+       OR a.AppCollections > 0 OR a.AppAmountPastDue > 0)
+  AND b.ChargebackFinalAmt > 0;
+
+
+--SQL Query: To evaluate combined rule impact.
+This yielded ~7869 flagged out of 15426 (51%), capturing 191 of 267 
+chargeback merchants (~72%).
+-- Flag merchants by any rule
+WITH flagged_ids AS (
+  SELECT SimuID 
+  FROM Merchant_application_data 
+  WHERE AppVantageScr < 700 OR AppPublicRecords>0 OR AppCollections>0 OR AppAmountPastDue>0
+  UNION
+  SELECT SimuID FROM Merchant_application_data 
+  WHERE MCCDescription IN ('Beauty Shops and Barber Shops', 'Miscellaneous Publishing...', ...)
+  UNION
+  SELECT SimuID FROM Merchant_batch_performance_data 
+  WHERE SaleCt > 20 OR deposit_risk_score > 50
+)
+
+-- Count flagged vs caught
+SELECT 
+  (SELECT COUNT(DISTINCT SimuID) FROM flagged_ids) AS merchants_flagged,
+  (SELECT COUNT(DISTINCT SimuID) FROM Merchant_application_data) AS merchants_total,
+  (SELECT COUNT(DISTINCT SimuID) FROM Merchant_batch_performance_data WHERE ChargebackFinalAmt > 0 
+         AND SimuID IN (SELECT SimuID FROM flagged_ids)) AS fraud_caught,
+  (SELECT COUNT(DISTINCT SimuID) FROM Merchant_batch_performance_data WHERE ChargebackFinalAmt > 0) AS total_fraud;
+
+
+--SQL Query: Join application and batch data, flag risk events
+SELECT b.SimuID,
+       b.PaymentChannel,
+       b.SalesAmt, b.Age,
+       CASE 
+         WHEN b.ChargebackFinalAmt > 0 OR b.ACHRtrnAmt > 0 
+         THEN 1 ELSE 0 
+       END AS RiskEvent
+INTO JoinedData
+FROM Merchant_application_data AS a
+JOIN Merchant_batch_performance_data AS b
+  ON a.SimuID = b.SimuID;
+
+
+-- Compute overall and segmented risk rates (example for tenure groups)
+SELECT 
+  CASE 
+    WHEN Age <= 30 THEN 'New (≤30d)'
+    WHEN Age <= 90 THEN 'Mid (31-90d)'
+    ELSE 'Old (>90d)' 
+  END AS TenureGroup,
+  COUNT(*) AS BatchCount,
+  AVG(RiskEvent)*100 AS RiskEventRate_pct
+FROM JoinedData
+GROUP BY 1;
+
+
+--SQL Query: Compute risk event rate by credit score band (low/medium/high)
+SELECT 
+  CASE 
+    WHEN a.AppVantageScr <= 600 THEN 'Low (<=600)'
+    WHEN a.AppVantageScr <= 750 THEN 'Medium (601-750)'
+    ELSE 'High (>750)' 
+  END AS ScoreBand,
+  COUNT(DISTINCT a.SimuID) AS Merchants,
+  ROUND(AVG(CASE WHEN (b.ChargebackFinalAmt>0 OR b.ACHRtrnAmt>0) THEN 1.0 ELSE 0.0 END)*100, 2) AS RiskRate_pct
+FROM Merchant_application_data a
+JOIN Merchant_batch_performance_data b 
+  ON a.SimuID = b.SimuID
+GROUP BY 1;
+
+--SQL Query: Example simulation of new policy rules on historical data 
+SELECT  SUM(CASE WHEN (Age<=30 AND AppVantageScr<=600 AND SalesAmt>10000) 
+              OR (deposit_risk_score>=0.8) 
+              OR (AppCollections>0 AND SalesAmt>5000)
+           THEN 1 ELSE 0 END) AS FlaggedBatches,
+  SUM(CASE WHEN (ChargebackFinalAmt>0 OR ACHRtrnAmt>0) 
+              AND ((Age<=30 AND AppVantageScr<=600 AND SalesAmt>10000) 
+                   OR (deposit_risk_score>=0.8) 
+                   OR (AppCollections>0 AND SalesAmt>5000))
+           THEN 1 ELSE 0 END) AS TruePositives,
+  SUM(CASE WHEN (ChargebackFinalAmt>0 OR ACHRtrnAmt>0) 
+              AND NOT ((Age<=30 AND AppVantageScr<=600 AND SalesAmt>10000) 
+                       OR (deposit_risk_score>=0.8) 
+                       OR (AppCollections>0 AND SalesAmt>5000))
+           THEN 1 ELSE 0 END) AS FalseNegatives
+FROM JoinedData;
+
+
+--SQL Query: Example analysis of a transaction count risk signal
+SELECT CASE WHEN SaleCt > 20 THEN 'HighTxnCount' ELSE 'Normal' END AS Segment,
+       COUNT(*) AS BatchCount,
+       AVG(CASE WHEN ChargebackFinalAmt IS NOT NULL OR ACHRtrnAmt IS NOT NULL 
+                THEN 1 ELSE 0 END)*100 AS FraudRatePct
+FROM Merchant_batch_performance_data
+GROUP BY Segment;
+
+--SQL Query: Combining rules example (Credit OR Early vs Credit AND MCC)
+SELECT 
+    SUM(CASE WHEN (CreditFlag=1 OR EarlyFlag=1) AND FraudEvent=1 THEN 1 ELSE 0 END) * 1.0 
+      / SUM(CASE WHEN FraudEvent=1 THEN 1 ELSE 0 END) AS Recall_Credit_OR_Early,
+    SUM(CASE WHEN (CreditFlag=1 AND MCCFlag=1) AND FraudEvent=1 THEN 1 ELSE 0 END) * 1.0 
+      / SUM(CASE WHEN (CreditFlag=1 AND MCCFlag=1) THEN 1 ELSE 0 END) AS Precision_Credit_AND_MCC
+FROM (
+  SELECT b.SimuID,
+         -- Flags from joined data
+         CASE WHEN a.AppVantageScr <= 600 OR a.AppPublicRecords > 0 
+                   OR a.AppCollections > 0 OR a.AppAmountPastDue > 0 THEN 1 ELSE 0 END AS CreditFlag,
+CASE WHEN a.MCC IN (<high-risk MCC list>) THEN 1 ELSE 0 END AS MCCFlag,
+         CASE WHEN b.Age <= 7 THEN 1 ELSE 0 END AS EarlyFlag,
+         CASE WHEN (b.ChargebackFinalAmt IS NOT NULL OR b.ACHRtrnAmt IS NOT NULL) THEN 1 ELSE 0 END AS FraudEvent
+  FROM Merchant_batch_performance_data b
+  JOIN Merchant_application_data a ON a.SimuID = b.SimuID
+) sub;
+
+
+--SQL Query: Assign risk tier based on rule flags
+WITH flagged_batches AS (
+  SELECT b.SimuID, b.Batch_Clear_Date,
+         -- (Assume flags are precomputed as 0/1 for each rule per batch)
+         CreditFlag, MCCFlag, EarlyFlag, RefundFlag, SpikeFlag,
+         (CASE WHEN ChargebackFinalAmt IS NOT NULL OR ACHRtrnAmt IS NOT NULL 
+               THEN 1 ELSE 0 END) AS FraudEvent
+  FROM Merchant_batch_performance_data b
+  JOIN Merchant_application_data a ON a.SimuID = b.SimuID
+)
+SELECT 
+  CASE 
+    WHEN (CreditFlag + MCCFlag + EarlyFlag + RefundFlag + SpikeFlag) >= 2 
+         OR RefundFlag = 1 
+      THEN 'High'
+    WHEN (CreditFlag + MCCFlag + EarlyFlag + RefundFlag + SpikeFlag) = 1 
+      THEN 'Medium'
+    ELSE 'Low' 
+  END AS RiskTier,
+  COUNT(*) AS BatchCount,
+  SUM(FraudEvent) AS FraudEventCount
+FROM flagged_batches
+GROUP BY RiskTier;
+
+
+--SQL Query: Combining rules example (Credit OR Early vs Credit AND MCC)
+SELECT 
+    SUM(CASE WHEN (CreditFlag=1 OR EarlyFlag=1) AND FraudEvent=1 THEN 1 ELSE 0 END) * 1.0 
+      / SUM(CASE WHEN FraudEvent=1 THEN 1 ELSE 0 END) AS Recall_Credit_OR_Early,
+    SUM(CASE WHEN (CreditFlag=1 AND MCCFlag=1) AND FraudEvent=1 THEN 1 ELSE 0 END) * 1.0 
+      / SUM(CASE WHEN (CreditFlag=1 AND MCCFlag=1) THEN 1 ELSE 0 END) AS Precision_Credit_AND_MCC
+FROM (
+  SELECT b.SimuID,
+         -- Flags from joined data
+         CASE WHEN a.AppVantageScr <= 600 OR a.AppPublicRecords > 0 
+                   OR a.AppCollections > 0 OR a.AppAmountPastDue > 0 THEN 1 ELSE 0 END AS CreditFlag,
+CASE WHEN a.MCC IN (<high-risk MCC list>) THEN 1 ELSE 0 END AS MCCFlag,
+         CASE WHEN b.Age <= 7 THEN 1 ELSE 0 END AS EarlyFlag,
+         CASE WHEN (b.ChargebackFinalAmt IS NOT NULL OR b.ACHRtrnAmt IS NOT NULL) THEN 1 ELSE 0 END AS FraudEvent
+  FROM Merchant_batch_performance_data b
+  JOIN Merchant_application_data a ON a.SimuID = b.SimuID
+) sub;
+
+
+-- SQL: Summary of baseline vs new policy performance (for reporting)
+WITH baseline AS (
+  SELECT 0.010 AS fraud_rate, 0.995 AS approval_rate, 0.5 AS flagged_rate, 0.30 AS precision_80
+),
+newpolicy AS (
+  SELECT 0.006 AS fraud_rate, 0.980 AS approval_rate, 0.010 AS flagged_rate, 0.50 AS precision_80
+)
+SELECT 
+  newpolicy.fraud_rate - baseline.fraud_rate AS fraud_rate_change,
+  newpolicy.precision_80 - baseline.precision_80 AS precision_gain,
+  newpolicy.flagged_rate - baseline.flagged_rate AS friction_change
+FROM baseline, newpolicy;
+
+-- SQL: Assign risk tier based on rule flags
+WITH flagged_batches AS (
+  SELECT b.SimuID, b.Batch_Clear_Date,
+         -- (Assume flags are precomputed as 0/1 for each rule per batch)
+         CreditFlag, MCCFlag, EarlyFlag, RefundFlag, SpikeFlag,
+         (CASE WHEN ChargebackFinalAmt IS NOT NULL OR ACHRtrnAmt IS NOT NULL 
+               THEN 1 ELSE 0 END) AS FraudEvent
+  FROM Merchant_batch_performance_data b
+  JOIN Merchant_application_data a ON a.SimuID = b.SimuID
+)
+SELECT 
+  CASE 
+    WHEN (CreditFlag + MCCFlag + EarlyFlag + RefundFlag + SpikeFlag) >= 2 
+         OR RefundFlag = 1 
+      THEN 'High'
+    WHEN (CreditFlag + MCCFlag + EarlyFlag + RefundFlag + SpikeFlag) = 1 
+      THEN 'Medium'
+    ELSE 'Low' 
+  END AS RiskTier,
+  COUNT(*) AS BatchCount,
+  SUM(FraudEvent) AS FraudEventCount
+FROM flagged_batches
+GROUP BY RiskTier;
+
+
+-- SQL: Calculate baseline fraud and approval metrics from batch data
+SELECT 
+  AVG(CASE WHEN ChargebackFinalAmt IS NOT NULL OR ACHRtrnAmt IS NOT NULL THEN 1.0 ELSE 0.0 END) AS base_fraud_rate,
+  AVG(CASE WHEN ChargebackFinalAmt IS NULL AND ACHRtrnAmt IS NULL THEN 1.0 ELSE 0.0 END) AS base_approval_rate,
+  COUNT(*) AS total_batches
+FROM Merchant_batch_performance_data;
+-- (We obtain overall fraud incident rate and approval rate from historical batches)
+
+
+
+-- SQL: Weekly aggregation of KPIs for monitoring
+SELECT DATEPART(week, Batch_Clear_Date) AS week,
+       COUNT(*) AS total_batches,
+       AVG(CASE WHEN ChargebackFinalAmt IS NOT NULL OR ACHRtrnAmt IS NOT NULL THEN 1.0 ELSE 0.0 END) AS fraud_rate,
+       AVG(CASE WHEN /* rule logic */ THEN 1.0 ELSE 0.0 END) AS flag_rate,
+       AVG(CASE WHEN ChargebackFinalAmt IS NULL AND ACHRtrnAmt IS NULL AND /* rule logic */ THEN 1.0 ELSE 0.0 END) AS false_positive_rate
+FROM Merchant_batch_performance_data
+GROUP BY DATEPART(week, Batch_Clear_Date);
+-- (This would use the rule logic to identify flagged batches and compare with outcomes)
+
+
+-- SQL: Summary of baseline vs new policy performance (for reporting)
+WITH baseline AS (
+  SELECT 0.010 AS fraud_rate, 0.995 AS approval_rate, 0.5 AS flagged_rate, 0.30 AS precision_80
+),
+newpolicy AS (
+  SELECT 0.006 AS fraud_rate, 0.980 AS approval_rate, 0.010 AS flagged_rate, 0.50 AS precision_80
+)
+SELECT 
+  newpolicy.fraud_rate - baseline.fraud_rate AS fraud_rate_change,
+  newpolicy.precision_80 - baseline.precision_80 AS precision_gain,
+  newpolicy.flagged_rate - baseline.flagged_rate AS friction_change
+FROM baseline, newpolicy;
+
+
